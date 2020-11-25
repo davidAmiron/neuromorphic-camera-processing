@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 from sklearn import linear_model
+from scipy import ndimage
 
 class SpatialDerivs:
     def __init__(self, direction: str, width: int, height: int):
@@ -25,7 +26,7 @@ class SpatialDerivs:
         self.decay_options = [None, 'exponential', 'constant', 'lifetime']
 
     def update(self, timestamp, x, y, polarity, norm=0.1, decay=None, exp_tau=0.1,
-               delay_dt=0.001, const_event_len=3e-2):
+               delay_dt=0.001, const_event_len=3e-2, removal_dt=0.001):
         """Update x derivatives using the kernel [-1, 1]
 
         Args:
@@ -40,6 +41,7 @@ class SpatialDerivs:
             exp_tau: decay time constant, should be positive
             decay_dt: delay of when to calculate exponential decay, in seconds
             const_event_len: when constant decay is selected, the number of milliseconds an event is active
+            removal_dt: delay of when to calculate event removal. Used for constant length and lifetime
 
         Notes:
             - Exponential decay will run on the first event after delay_dt from the previous decay
@@ -60,15 +62,38 @@ class SpatialDerivs:
 
         # Assign event removal times for contant and lifetime estimation
         if decay == 'constant':
-            self.to_remove.append({'time': timestamp, 'y': y, 'x': x, 'delta': pol * norm})
+            self.to_remove.append({'time': timestamp + const_event_len,
+                                   'y': y,
+                                   'x': x,
+                                   'delta': pol * norm})
             if self.direction == 'x':
-                self.to_remove.append({'time': timestamp, 'y': y, 'x': max(x - 1, 0), 'delta': -pol * norm})
+                self.to_remove.append({'time': timestamp + const_event_len,
+                                       'y': y,
+                                       'x': max(x - 1, 0),
+                                       'delta': -pol * norm})
             else:
-                self.to_remove.append({'time': timestamp, 'y': max(y - 1, 0), 'x': x, 'delta': -pol * norm})
+                self.to_remove.append({'time': timestamp + const_event_len,
+                                       'y': max(y - 1, 0),
+                                       'x': x,
+                                       'delta': -pol * norm})
         elif decay == 'lifetime':
-            self.optical_flow.update(timestamp, x, y, polarity)
-            lifetime = 1
-            #self.to_remove.append({'
+            lifetime = self.optical_flow.update(timestamp, x, y, polarity, lifetime=True)
+            print(lifetime)
+            self.to_remove.append({'time': timestamp + lifetime,
+                                   'y': y,
+                                   'x': x,
+                                   'delta': pol * norm})
+            if self.direction == 'x':
+                self.to_remove.append({'time': timestamp + lifetime,
+                                       'y': y,
+                                       'x': max(x - 1, 0),
+                                       'delta': -pol * norm})
+            else:
+                self.to_remove.append({'time': timestamp + lifetime,
+                                       'y': max(y - 1, 0),
+                                       'x': x,
+                                       'delta': -pol * norm})
+
 
         # Only update exponential decay every delay_dt to save computation
         if decay == 'exponential' and timestamp >= self.last_decay_t + delay_dt:
@@ -76,7 +101,7 @@ class SpatialDerivs:
             self.derivs += (-1 / exp_tau) * self.derivs * dt
             self.last_decay_t = timestamp
 
-        elif decay == 'constant' and timestamp >= self.last_decay_t + const_event_len:
+        elif decay in ['constant', 'lifetime'] and timestamp >= self.last_decay_t + removal_dt:
             self.last_decay_t = timestamp
             next_to_remove = []
             for event in self.to_remove:
@@ -144,18 +169,19 @@ class OpticalFlow:
                 img = cv2.arrowedLine(img, start_point, end_point, 255, 1)
         return img
 
-    def update(self, timestamp, x, y, polarity):
+    def update(self, timestamp, x, y, polarity, lifetime=False):
         """Update optical flow vector field
 
         Look at only positive events??
         """
-        if polarity == 1:
-            return
+        if polarity == 0:
+            return 0
         
         self.total += 1
 
         self.sae[y, x] = timestamp
-        if self.curr_event == self.calc_spacing:
+        tau = None
+        if self.curr_event == self.calc_spacing or lifetime:
             self.curr_event = 0
             
             # Get events in window
@@ -182,18 +208,31 @@ class OpticalFlow:
                 # Get fit coefficients
                 cx = ransac.estimator_.coef_[0]
                 cy = ransac.estimator_.coef_[1]
-                print(cx)
+                """print(cx)
                 print(cy)
-                print()
+                print()"""
+
+                if lifetime:
+                    tau = np.sqrt(cx * cx + cy * cy)
+
                 if cx != 0 and cy != 0:
-                    dxdt = 1 / ransac.estimator_.coef_[0]
-                    dydt = 1 / ransac.estimator_.coef_[1]
+                    dxdt = 1 / cx
+                    dydt = 1 / cy
                     self.flows[y, x, 0] = dxdt
                     self.flows[y, x, 1] = dydt
             except ValueError as v:
                 self.num_fail += 1
+                print('fail')
             
             
         else:
             self.curr_event += 1
 
+        if lifetime:
+            return tau if tau is not None else 0 # return 0 when no lifetime found
+
+def post_process(data, method, median_size=5):
+    if method == 'median_space':
+        return ndimage.median_filter(data, size=median_size)
+    else:
+        raise ValueError('Invalid method.')
